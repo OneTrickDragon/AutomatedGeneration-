@@ -26,6 +26,11 @@ from skimage.metrics import structural_similarity
 
 import config
 
+DEFAULT_PROMPT = (
+    "warm ivory plaster wall with a sunlit limestone ledge, soft morning light, "
+    "quiet luxury, minimal editorial fashion styling, gentle natural shadows"
+)
+
 
 class SceneError(RuntimeError):
     """A provider could not return a usable scene image."""
@@ -155,7 +160,11 @@ def _gradient(prompt: str) -> Image.Image:
 
 
 def generate_scene(prompt: str) -> Image.Image:
-    full_prompt = f"{prompt.strip()}, {config.SCENE_SUFFIX}"
+    full_prompt = (
+        f"{prompt.strip()}, {config.SCENE_SUFFIX}. Generate the background scene only. "
+        "Do not generate, depict, suggest, duplicate, or reserve a copy of the product; "
+        "the real product will be composited afterward."
+    )
     provider = config.SCENE_PROVIDER
     if provider == "local":
         return _gradient(full_prompt)
@@ -312,7 +321,26 @@ def _caption(frame: Image.Image, text: str) -> None:
         y += height + 18
 
 
-def render_video(path: Path, scene: Image.Image, product_layer: Image.Image, xy: tuple[int, int], caption: str) -> None:
+def motion_profile(prompt: str) -> tuple[float, float, float]:
+    """Return horizontal, vertical and sway strengths inferred from prompt words."""
+    text = prompt.lower()
+    horizontal = 0.0
+    vertical = 0.0
+    sway = 0.0
+    if any(word in text for word in ("left", "drift left", "move left")):
+        horizontal -= 1.0
+    if any(word in text for word in ("right", "drift right", "move right")):
+        horizontal += 1.0
+    if any(word in text for word in ("upward", "rise", "float", "lift")):
+        vertical -= 1.0
+    if any(word in text for word in ("downward", "sink", "lower")):
+        vertical += 1.0
+    if any(word in text for word in ("sway", "swing", "gentle movement", "breeze", "wind")):
+        sway = 1.0
+    return horizontal, vertical, sway
+
+
+def render_video(path: Path, scene: Image.Image, product_layer: Image.Image, xy: tuple[int, int], caption: str, prompt: str) -> None:
     """Render independent background/product layers to raw frames and encode H.264."""
     ffmpeg = os.getenv("FFMPEG", "ffmpeg")
     frames = config.VIDEO_SECONDS * config.FPS
@@ -322,6 +350,7 @@ def render_video(path: Path, scene: Image.Image, product_layer: Image.Image, xy:
     except FileNotFoundError as exc:
         raise RuntimeError("FFmpeg was not found. Install FFmpeg or set FFMPEG to its executable path.") from exc
     assert process.stdin is not None
+    horizontal, vertical, sway = motion_profile(prompt)
     try:
         for frame_no in range(frames):
             t = frame_no / max(1, frames - 1)
@@ -332,8 +361,9 @@ def render_video(path: Path, scene: Image.Image, product_layer: Image.Image, xy:
             frame = background.convert("RGBA")
             fx = round(config.WIDTH / 2 - product.width / 2)
             fy = round(config.HEIGHT * config.PRODUCT_CENTER_Y_FRACTION - product.height / 2)
-            # A small slower counter-motion creates a restrained parallax impression.
-            fx += round(-2 * math.sin(t * math.pi))
+            # Transform the real cutout only; no model redraws or invents product pixels.
+            fx += round(horizontal * config.WIDTH * 0.07 * t + sway * 18 * math.sin(t * math.pi * 2))
+            fy += round(vertical * config.HEIGHT * 0.04 * t)
             shadow = make_shadow(product.size)
             frame.alpha_composite(shadow, (fx, fy + round(product.height * 0.015)))
             frame.alpha_composite(product, (fx, fy))
@@ -366,7 +396,11 @@ def log_run(timestamp: str, product: Path, prompt: str, provider: str, qa: str) 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Turn a product photo into a styled still and vertical reel.")
     parser.add_argument("--product", required=True, type=Path, help="Product photo (PNG/JPG)")
-    parser.add_argument("--prompt", required=True, help="Describe the background and scene")
+    parser.add_argument(
+        "--prompt",
+        default=DEFAULT_PROMPT,
+        help="Describe the background and scene (default: the purple-shawl editorial scene)",
+    )
     parser.add_argument("--mode", choices=("image", "video", "both"), default="both")
     parser.add_argument("--caption", default="", help="Optional video text overlay")
     parser.add_argument("--variations", type=int, default=1, help="Number of backgrounds to create (1 or more)")
@@ -376,9 +410,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     load_dotenv(Path(__file__).resolve().parent / ".env")
     args = parse_args()
-    product_path = args.product.expanduser().resolve()
+    product_path = args.product.expanduser()
+    if not product_path.is_absolute():
+        product_path = (Path.cwd() / product_path)
+    product_path = product_path.resolve()
+    # Accept the common `assests` typo when the user has an existing folder by that name.
     if not product_path.is_file():
-        print(f"Product photo not found: {product_path}", file=sys.stderr)
+        alternate = Path(str(product_path).replace("\\assests\\", "\\assets\\").replace("/assests/", "/assets/"))
+        if alternate.is_file():
+            product_path = alternate
+        else:
+            alternate = Path(str(product_path).replace("\\assets\\", "\\assests\\").replace("/assets/", "/assests/"))
+            if alternate.is_file():
+                product_path = alternate
+    if not product_path.is_file():
+        print(f"Product photo not found: {product_path}. Check the spelling of the assets folder and the filename.", file=sys.stderr)
         return 2
     if product_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
         print("Product must be a PNG or JPG image.", file=sys.stderr)
@@ -411,7 +457,7 @@ def main() -> int:
                 output_files.append(image_path)
             if args.mode in ("video", "both"):
                 video_path = config.OUTPUTS_DIR / f"{base}.mp4"
-                render_video(video_path, scene, placed, xy, args.caption)
+                render_video(video_path, scene, placed, xy, args.caption, args.prompt)
                 output_files.append(video_path)
         print(f"Run QA: {overall_qa}")
         print("Output files:")
