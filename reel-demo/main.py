@@ -25,6 +25,8 @@ from dotenv import load_dotenv
 from skimage.color import rgb2lab, deltaE_ciede2000
 from skimage.metrics import structural_similarity
 
+# Load project-local credentials before importing configuration values that depend on them.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 import config
 
 DEFAULT_PROMPT = {
@@ -435,7 +437,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+    # Keep this call for callers that invoke main() after changing environment values.
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=False)
+    config.SCENE_PROVIDER = os.getenv("SCENE_PROVIDER", config.SCENE_PROVIDER).strip().lower()
     args = parse_args()
     product_path = args.product.expanduser()
     if not product_path.is_absolute():
