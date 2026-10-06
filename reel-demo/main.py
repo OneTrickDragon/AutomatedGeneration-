@@ -6,6 +6,7 @@ import argparse
 import csv
 import hashlib
 import io
+import json
 import math
 import os
 import re
@@ -26,10 +27,12 @@ from skimage.metrics import structural_similarity
 
 import config
 
-DEFAULT_PROMPT = (
-    "warm ivory plaster wall with a sunlit limestone ledge, soft morning light, "
-    "quiet luxury, minimal editorial fashion styling, gentle natural shadows"
-)
+DEFAULT_PROMPT = {
+    "scene": "warm ivory plaster wall with a sunlit limestone ledge",
+    "lighting": "soft morning light",
+    "style": "quiet luxury, minimal editorial fashion styling",
+    "environment": "gentle natural shadows",
+}
 
 
 class SceneError(RuntimeError):
@@ -83,15 +86,20 @@ def _retry(call: Callable[[], bytes], provider: str) -> bytes:
     raise AssertionError("unreachable")
 
 
-def _gemini(prompt: str) -> bytes:
+def _gemini(prompt: str, cutout: Image.Image) -> bytes:
     def call() -> bytes:
         from google import genai
         from google.genai import types
 
         client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        image_buffer = io.BytesIO()
+        cutout.convert("RGBA").save(image_buffer, format="PNG")
         response = client.models.generate_content(
             model=config.GEMINI_MODEL,
-            contents=prompt,
+            contents=[
+                types.Part.from_text(text=prompt),
+                types.Part.from_bytes(data=image_buffer.getvalue(), mime_type="image/png"),
+            ],
             config=types.GenerateContentConfig(
                 response_modalities=["IMAGE"],
                 image_config=types.ImageConfig(aspect_ratio="9:16", image_size="1K"),
@@ -108,15 +116,18 @@ def _gemini(prompt: str) -> bytes:
     return _retry(call, "Gemini")
 
 
-def _huggingface(prompt: str) -> bytes:
+def _huggingface(prompt: str, cutout: Image.Image) -> bytes:
     if not os.getenv("HF_TOKEN"):
         raise SceneError("SCENE_PROVIDER=huggingface requires HF_TOKEN in .env.")
 
     def call() -> bytes:
+        buffer = io.BytesIO()
+        cutout.convert("RGBA").save(buffer, format="PNG")
         response = requests.post(
             f"https://router.huggingface.co/hf-inference/models/{config.HF_MODEL}",
             headers={"Authorization": f"Bearer {os.environ['HF_TOKEN']}", "Accept": "image/png"},
-            json={"inputs": prompt, "parameters": {"width": config.WIDTH, "height": config.HEIGHT}},
+            data={"inputs": prompt, "parameters": json.dumps({"width": config.WIDTH, "height": config.HEIGHT})},
+            files={"image": ("product.png", buffer.getvalue(), "image/png")},
             timeout=180,
         )
         if response.status_code == 429 or response.status_code >= 500:
@@ -130,7 +141,10 @@ def _huggingface(prompt: str) -> bytes:
     return _retry(call, "Hugging Face")
 
 
-def _pollinations(prompt: str) -> bytes:
+def _pollinations(prompt: str, cutout: Image.Image) -> bytes:
+    raise SceneError("Pollinations does not accept a reference image in this adapter. Use SCENE_PROVIDER=gemini or huggingface for image-conditioned generation.")
+
+    # Kept for API compatibility if Pollinations adds image-reference support.
     def call() -> bytes:
         url = "https://image.pollinations.ai/prompt/" + quote(prompt, safe="")
         response = requests.get(
@@ -159,23 +173,36 @@ def _gradient(prompt: str) -> Image.Image:
     return Image.fromarray(pixels, "RGB")
 
 
-def generate_scene(prompt: str) -> Image.Image:
+def prompt_text(prompt: str) -> str:
+    """Serialize the default JSON prompt, while preserving plain custom prompts."""
+    try:
+        value = json.loads(prompt)
+    except json.JSONDecodeError:
+        return prompt.strip()
+    if not isinstance(value, dict):
+        return prompt.strip()
+    return ", ".join(f"{key}: {value}" for key, value in value.items())
+
+
+def generate_scene(prompt: str, cutout: Image.Image) -> Image.Image:
+    scene_prompt = prompt_text(prompt)
     full_prompt = (
-        f"{prompt.strip()}, {config.SCENE_SUFFIX}. Generate the background scene only. "
-        "Do not generate, depict, suggest, duplicate, or reserve a copy of the product; "
-        "the real product will be composited afterward."
+        f"{scene_prompt}, {config.SCENE_SUFFIX}. Use the attached product cutout as a visual reference. "
+        "Render that same product naturally inside the scene with its identity and important visual characteristics preserved. "
+        "Choose appropriate product positioning, scale, perspective, lighting, contact shadows, reflections, and environment interaction. "
+        "This is image-conditioned generation, not a pasted cutout. Do not add a second product."
     )
     provider = config.SCENE_PROVIDER
     if provider == "local":
         return _gradient(full_prompt)
-    providers: dict[str, Callable[[str], bytes]] = {
+    providers: dict[str, Callable[[str, Image.Image], bytes]] = {
         "gemini": _gemini,
         "huggingface": _huggingface,
         "pollinations": _pollinations,
     }
     if provider not in providers:
         raise SceneError(f"Unknown SCENE_PROVIDER={provider!r}. Choose gemini, huggingface, pollinations, or local.")
-    raw = providers[provider](full_prompt)
+    raw = providers[provider](full_prompt, cutout)
     try:
         return Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception as exc:
@@ -398,7 +425,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--product", required=True, type=Path, help="Product photo (PNG/JPG)")
     parser.add_argument(
         "--prompt",
-        default=DEFAULT_PROMPT,
+        default=json.dumps(DEFAULT_PROMPT),
         help="Describe the background and scene (default: the purple-shawl editorial scene)",
     )
     parser.add_argument("--mode", choices=("image", "video", "both"), default="both")
@@ -446,7 +473,7 @@ def main() -> int:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             suffix = f"_{index + 1:02d}" if args.variations > 1 else ""
             base = f"{slug(product_path.stem)}_{stamp}{suffix}"
-            scene = fit_scene(generate_scene(args.prompt))
+            scene = fit_scene(generate_scene(args.prompt, product))
             still, placed, xy, size = composite(scene, product)
             qa, _, _, _ = qa_check(still, product, xy, size)
             overall_qa = "FAIL" if qa == "FAIL" else overall_qa
