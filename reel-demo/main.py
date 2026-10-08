@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import hashlib
 import io
@@ -34,6 +35,7 @@ DEFAULT_PROMPT = {
     "lighting": "soft morning light",
     "style": "quiet luxury, minimal editorial fashion styling",
     "environment": "gentle natural shadows",
+    "arrangement": "gently unfurled and draped along the ledge",
 }
 
 
@@ -75,10 +77,11 @@ def _retry(call: Callable[[], bytes], provider: str) -> bytes:
             message = str(exc)
             low = message.lower()
             quota = any(word in low for word in ("quota", "429", "rate limit", "resource_exhausted"))
-            if quota and attempt == config.MAX_RETRIES - 1:
+            if quota:
+                # Retrying a quota error only burns more quota; fail fast and show the provider's message.
                 raise SceneError(
-                    f"{provider} quota/rate limit exhausted after {config.MAX_RETRIES} attempts. "
-                    "Wait for the provider's free-tier quota to reset, use another provider, or set SCENE_PROVIDER=local."
+                    f"{provider} quota/rate limit hit: {message[:300]} "
+                    "Wait for the quota to reset, use another provider, or set SCENE_PROVIDER=local."
                 ) from exc
             if attempt == config.MAX_RETRIES - 1:
                 raise SceneError(f"{provider} scene generation failed: {message}") from exc
@@ -125,11 +128,17 @@ def _huggingface(prompt: str, cutout: Image.Image) -> bytes:
     def call() -> bytes:
         buffer = io.BytesIO()
         cutout.convert("RGBA").save(buffer, format="PNG")
+        image_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
         response = requests.post(
             f"https://router.huggingface.co/hf-inference/models/{config.HF_MODEL}",
             headers={"Authorization": f"Bearer {os.environ['HF_TOKEN']}", "Accept": "image/png"},
-            data={"inputs": prompt, "parameters": json.dumps({"width": config.WIDTH, "height": config.HEIGHT})},
-            files={"image": ("product.png", buffer.getvalue(), "image/png")},
+            json={
+                "inputs": image_b64,
+                "parameters": {
+                    "prompt": prompt,
+                    "target_size": {"width": config.WIDTH, "height": config.HEIGHT},
+                },
+            },
             timeout=180,
         )
         if response.status_code == 429 or response.status_code >= 500:
@@ -141,6 +150,57 @@ def _huggingface(prompt: str, cutout: Image.Image) -> bytes:
         return response.content
 
     return _retry(call, "Hugging Face")
+
+
+def regenerates(provider: str) -> bool:
+    """True when the image model re-renders the product itself (no cutout paste, no pixel-exact QA)."""
+    return config.REGENERATE_PRODUCT and provider != "local"
+
+
+def _product_on_backdrop(cutout: Image.Image) -> Image.Image:
+    """Reference image for the model: the product alone on a plain backdrop, centred, no shadow.
+    It only tells the model WHAT the product is; the prompt asks for a new pose and scene.
+    An RGB image is returned: transparent pixels would otherwise turn black when a provider drops alpha."""
+    base = Image.new("RGBA", (config.WIDTH, config.HEIGHT), (240, 238, 234, 255))
+    placed, size = prepare_product(cutout)  # no scene tint: keep product pixels untouched
+    base.alpha_composite(placed, placement(size))
+    return base.convert("RGB")
+
+
+def _kontext(prompt: str, cutout: Image.Image) -> bytes:
+    """FLUX.1 Kontext [dev] through the official Hugging Face Space (free, ZeroGPU quota)."""
+    token = os.getenv("HF_TOKEN")
+    if not token:
+        raise SceneError("SCENE_PROVIDER=kontext requires HF_TOKEN in .env (your ZeroGPU quota is tied to it).")
+    try:
+        from gradio_client import Client, handle_file
+    except ImportError as exc:
+        raise SceneError("gradio_client is missing. Run: pip install gradio_client") from exc
+
+    def call() -> bytes:
+        try:
+            client = Client(config.KONTEXT_SPACE, token=token)
+        except TypeError:  # older gradio_client versions
+            client = Client(config.KONTEXT_SPACE, hf_token=token)
+        tmp = config.OUTPUTS_DIR / "_kontext_input.png"
+        cutout.convert("RGB").resize((config.KONTEXT_WIDTH, config.KONTEXT_HEIGHT), Image.Resampling.LANCZOS).save(tmp, "PNG")
+        result = client.predict(
+            input_image=handle_file(str(tmp)),
+            prompt=prompt,
+            seed=0,
+            randomize_seed=True,
+            guidance_scale=2.5,
+            steps=28,
+            api_name="/infer",
+        )
+        image = result[0] if isinstance(result, (tuple, list)) else result
+        if isinstance(image, dict):
+            image = image.get("path") or image.get("value")
+        if not image:
+            raise RuntimeError(f"Kontext Space returned no image: {result!r}"[:500])
+        return Path(image).read_bytes()
+
+    return _retry(call, "Kontext")
 
 
 def _pollinations(prompt: str, cutout: Image.Image) -> bytes:
@@ -186,8 +246,21 @@ def prompt_text(prompt: str) -> str:
     return ", ".join(f"{key}: {value}" for key, value in value.items())
 
 
-def generate_scene(prompt: str, cutout: Image.Image) -> Image.Image:
-    scene_prompt = prompt_text(prompt)
+def split_prompt(prompt: str) -> tuple[str, str]:
+    """Return (scene description, arrangement). A JSON prompt may carry an "arrangement" key."""
+    try:
+        value = json.loads(prompt)
+    except json.JSONDecodeError:
+        return prompt.strip(), ""
+    if not isinstance(value, dict):
+        return prompt.strip(), ""
+    arrangement = str(value.pop("arrangement", "") or "").strip()
+    return ", ".join(str(v) for v in value.values() if v), arrangement
+
+
+def generate_scene(prompt: str, cutout: Image.Image, arrangement: str = "", subject: str = "") -> Image.Image:
+    scene_prompt, json_arrangement = split_prompt(prompt)
+    arrangement = arrangement.strip() or json_arrangement
     full_prompt = (
         f"{scene_prompt}, {config.SCENE_SUFFIX}. Use the attached product cutout as a visual reference. "
         "Render that same product naturally inside the scene with its identity and important visual characteristics preserved. "
@@ -200,15 +273,43 @@ def generate_scene(prompt: str, cutout: Image.Image) -> Image.Image:
     providers: dict[str, Callable[[str, Image.Image], bytes]] = {
         "gemini": _gemini,
         "huggingface": _huggingface,
+        "kontext": _kontext,
         "pollinations": _pollinations,
     }
     if provider not in providers:
-        raise SceneError(f"Unknown SCENE_PROVIDER={provider!r}. Choose gemini, huggingface, pollinations, or local.")
-    raw = providers[provider](full_prompt, cutout)
+        raise SceneError(f"Unknown SCENE_PROVIDER={provider!r}. Choose gemini, huggingface, kontext, pollinations, or local.")
+    source = cutout
+    if regenerates(provider) or provider == "kontext":
+        # Re-render mode: the reference only identifies the product. The model must remove the mannequin /
+        # backdrop, re-pose the product, and build a new scene around it.
+        source = _product_on_backdrop(cutout)
+        who = f"this {subject.strip()}" if subject.strip() else "the product shown in the reference image"
+        pose = arrangement or "naturally arranged to suit the scene (for example gently unfurled or neatly folded)"
+        full_prompt = (
+            "Use the reference image only to identify the product. Remove any mannequin, dress form, hanger, stand, "
+            "model, shadow and backdrop from it: none of them may appear in the result. "
+            f"Create a new photograph of {who}, {pose}. Scene: {scene_prompt}. "
+            "Do not copy the reference's pose, drape, layout or camera angle; re-pose the product so it follows the "
+            "natural physics of its material. Keep the product's identity exactly: same colour, material, sheen, "
+            "texture, pattern, proportions, stitching and any logos or text. Realistic contact shadows and "
+            "reflections. No people, no other products, no added text. Photorealistic, 9:16 vertical."
+        )
+    cache = None
+    if config.SCENE_CACHE:
+        key = hashlib.sha256((provider + full_prompt).encode("utf-8") + source.convert("RGBA").tobytes()).hexdigest()[:16]
+        cache = config.OUTPUTS_DIR / "scene_cache" / f"{provider}_{key}.png"
+        if cache.exists():
+            print(f"Using cached {provider} scene: {cache.name}")
+            return Image.open(cache).convert("RGB")
+    raw = providers[provider](full_prompt, source)
     try:
-        return Image.open(io.BytesIO(raw)).convert("RGB")
+        scene = Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception as exc:
         raise SceneError(f"{provider} returned data that was not a readable image: {exc}") from exc
+    if cache is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        scene.save(cache, "PNG")
+    return scene
 
 
 def fit_scene(scene: Image.Image) -> Image.Image:
@@ -386,17 +487,21 @@ def render_video(path: Path, scene: Image.Image, product_layer: Image.Image, xy:
             bg_zoom = 1.0 + 0.08 * t
             fg_zoom = 1.0 + 0.05 * t
             background = _zoom_crop(scene, bg_zoom, round(4 * math.sin(t * math.pi)), round(-8 * t))
-            product = product_layer.resize((round(product_layer.width * fg_zoom), round(product_layer.height * fg_zoom)), Image.Resampling.LANCZOS)
-            frame = background.convert("RGBA")
-            fx = round(config.WIDTH / 2 - product.width / 2)
-            fy = round(config.HEIGHT * config.PRODUCT_CENTER_Y_FRACTION - product.height / 2)
-            # Transform the real cutout only; no model redraws or invents product pixels.
-            fx += round(horizontal * config.WIDTH * 0.07 * t + sway * 18 * math.sin(t * math.pi * 2))
-            fy += round(vertical * config.HEIGHT * 0.04 * t)
-            shadow = make_shadow(product.size)
-            frame.alpha_composite(shadow, (fx, fy + round(product.height * 0.015)))
-            frame.alpha_composite(product, (fx, fy))
-            rgb = frame.convert("RGB")
+            if product_layer is None:
+                # Regenerated scene: the product is already part of the image, so only the slow zoom applies.
+                rgb = background.convert("RGB")
+            else:
+                product = product_layer.resize((round(product_layer.width * fg_zoom), round(product_layer.height * fg_zoom)), Image.Resampling.LANCZOS)
+                frame = background.convert("RGBA")
+                fx = round(config.WIDTH / 2 - product.width / 2)
+                fy = round(config.HEIGHT * config.PRODUCT_CENTER_Y_FRACTION - product.height / 2)
+                # Transform the real cutout only; no model redraws or invents product pixels.
+                fx += round(horizontal * config.WIDTH * 0.07 * t + sway * 18 * math.sin(t * math.pi * 2))
+                fy += round(vertical * config.HEIGHT * 0.04 * t)
+                shadow = make_shadow(product.size)
+                frame.alpha_composite(shadow, (fx, fy + round(product.height * 0.015)))
+                frame.alpha_composite(product, (fx, fy))
+                rgb = frame.convert("RGB")
             _caption(rgb, caption)
             fade = min(1.0, t * 5.0, (1.0 - t) * 5.0)
             if fade < 1.0:
@@ -432,6 +537,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=("image", "video", "both"), default="both")
     parser.add_argument("--caption", default="", help="Optional video text overlay")
+    parser.add_argument("--arrangement", default="", help='How the product is shown, e.g. "neatly folded on a wooden table" or "unfurled along a stone ledge" (overrides the prompt\'s arrangement)')
+    parser.add_argument("--subject", default="", help='Short product noun for the model, e.g. "purple satin scarf" (improves results)')
     parser.add_argument("--variations", type=int, default=1, help="Number of backgrounds to create (1 or more)")
     return parser.parse_args()
 
@@ -477,10 +584,17 @@ def main() -> int:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             suffix = f"_{index + 1:02d}" if args.variations > 1 else ""
             base = f"{slug(product_path.stem)}_{stamp}{suffix}"
-            scene = fit_scene(generate_scene(args.prompt, product))
-            still, placed, xy, size = composite(scene, product)
-            qa, _, _, _ = qa_check(still, product, xy, size)
-            overall_qa = "FAIL" if qa == "FAIL" else overall_qa
+            scene = fit_scene(generate_scene(args.prompt, product, args.arrangement, args.subject))
+            if regenerates(provider):
+                # The model re-rendered the product inside the scene: nothing to paste, and the pixel-exact
+                # QA does not apply (inspect the result visually for now).
+                still, placed, xy, size = scene, None, (0, 0), (0, 0)
+                qa = "SKIPPED"
+                overall_qa = "SKIPPED (visual check)"
+            else:
+                still, placed, xy, size = composite(scene, product)
+                qa, _, _, _ = qa_check(still, product, xy, size)
+                overall_qa = "FAIL" if qa == "FAIL" else overall_qa
             log_run(stamp, product_path, args.prompt, provider, qa)
             if args.mode in ("image", "both"):
                 image_path = config.OUTPUTS_DIR / f"{base}.png"
