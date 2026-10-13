@@ -1,0 +1,8 @@
+rembg[cpu]>=2.0.60
+pillow>=10.0
+opencv-python>=4.8
+numpy>=1.26
+requests>=2.31
+google-genai>=1.0
+scikit-image>=0.22
+python-dotenv>=1.0
